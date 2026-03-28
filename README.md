@@ -66,6 +66,8 @@ pnpm install
 |------|------|
 | `DATABASE_URL` | 异步连接串，如 `mysql+aiomysql://user:pass@host:3306/db` |
 | `REDIS_URL` | 如 `redis://127.0.0.1:6379/0`，不配则内存缓存 |
+| `API_PORT` | 后端监听端口，默认 **8010**（避免部分 Windows 上 **8000** 触发 `WinError 10013`） |
+| `SQLDOCTOR_RELOAD` | 设为 `1` 时 `run.bat` 为后端加上 `--reload`（默认关闭，减少 Windows 套接字错误） |
 | `LLM_MODEL` | 大模型名（RAG 诊断必填） |
 | `OLLAMA_BASE_URL` | 默认 `http://127.0.0.1:11434`，会自动拼 `/v1` 给 Chat 用 |
 | `LLM_OPENAI_BASE_URL` | 覆盖完整 OpenAI 兼容根 URL（含 `/v1`） |
@@ -85,7 +87,7 @@ pnpm install
 **1）启动 API（项目根目录）**
 
 ```bash
-python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
+python -m uvicorn backend.main:app --host 127.0.0.1 --port 8010 --reload
 ```
 
 首次若不想构建知识库，可临时：
@@ -93,10 +95,10 @@ python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000 --reload
 ```bash
 # Windows PowerShell
 $env:KB_ENABLED="false"
-python -m uvicorn backend.main:app --host 127.0.0.1 --port 8000
+python -m uvicorn backend.main:app --host 127.0.0.1 --port 8010
 ```
 
-- 交互文档：<http://127.0.0.1:8000/docs>  
+- 交互文档：<http://127.0.0.1:8010/docs>  
 - 健康检查：`GET /api/health`
 
 **2）Streamlit 界面**
@@ -122,7 +124,12 @@ cd frontend
 pnpm dev
 ```
 
-默认通过 `next.config` 将 `/api/*` 代理到 `http://127.0.0.1:8000`。
+默认通过 `next.config` 将 `/api/*` 代理到 `http://127.0.0.1:8010`（与 `API_PORT` 一致；改端口时请设置环境变量 `API_PORT` 后重新执行 `pnpm dev`）。
+
+### Windows：`WinError 10013`（套接字访问被拒绝）
+
+1. **`run.bat` 默认已关闭 `--reload`**：Uvicorn 在 Windows 上带热重载时，重载进程会额外占用套接字，不少环境会报 10013。需要热重载时在运行前执行 `set SQLDOCTOR_RELOAD=1`（PowerShell：`$env:SQLDOCTOR_RELOAD="1"`），并已安装依赖里的 **`watchfiles`**（对重载更友好）。  
+2. **端口**：若关闭重载后仍报错，再换端口：`set API_PORT=9020` 或见下。默认 **8010**；也可用 `netstat -ano | findstr :8010` 查占用；`netsh interface ipv4 show excludedportrange protocol=tcp` 查看系统排除的端口段。
 
 ## API 摘要
 

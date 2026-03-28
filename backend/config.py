@@ -21,6 +21,12 @@ class Settings(BaseSettings):
 
     app_name: str = Field(default="SQLDoctor API")
     debug: bool = Field(default=False)
+    api_port: int = Field(
+        default=8010,
+        ge=1,
+        le=65535,
+        description="uvicorn 监听端口；Windows 上 8000 若报 WinError 10013 可改环境变量 API_PORT",
+    )
 
     database_url: str | None = Field(
         default=None,

@@ -62,11 +62,12 @@ app = create_app()
 def main() -> None:
     import uvicorn
 
+    s = get_settings()
     uvicorn.run(
         "backend.main:app",
         host="0.0.0.0",
-        port=8000,
-        reload=bool(get_settings().debug),
+        port=s.api_port,
+        reload=bool(s.debug),
     )
 
 

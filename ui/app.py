@@ -16,7 +16,7 @@ import streamlit as st
 
 from app_exception import AppException
 
-DEFAULT_API = "http://127.0.0.1:8000"
+DEFAULT_API = "http://127.0.0.1:8010"
 
 SESSION_TURNS = "sqldoctor_turns"
 SESSION_API = "sqldoctor_api_base"

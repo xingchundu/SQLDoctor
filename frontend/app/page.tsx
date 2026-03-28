@@ -41,7 +41,7 @@ export default function HomePage() {
       <header>
         <h1 className="text-2xl font-semibold tracking-tight">SQL Doctor</h1>
         <p className="text-sm text-slate-600">
-          Next.js 通过 rewrite 代理到 FastAPI（默认 127.0.0.1:8000）。
+          Next.js 通过 rewrite 代理到 FastAPI（默认 127.0.0.1:8010，环境变量 API_PORT）。
         </p>
       </header>
       <section className="grid gap-4 md:grid-cols-[1fr_160px]">
