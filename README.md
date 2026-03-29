@@ -53,6 +53,8 @@ SQLDoctor/
 python -m pip install -r requirements.txt
 ```
 
+**RAG / 知识库**：`langchain-huggingface`、`sentence-transformers`、`faiss-cpu` 等已写在 `requirements.txt` 中；必须用**与启动 uvicorn 相同的 Python** 安装（例如 `py -3 -m pip install -r requirements.txt`）。若暂时不需要 RAG，可在 `.env` 中设 `KB_ENABLED=false` 跳过向量模型与索引加载。
+
 前端（可选）：
 
 ```bash
@@ -68,10 +70,12 @@ pnpm install
 | `REDIS_URL` | 如 `redis://127.0.0.1:6379/0`，不配则内存缓存 |
 | `API_PORT` | 后端监听端口，默认 **8010**（避免部分 Windows 上 **8000** 触发 `WinError 10013`） |
 | `SQLDOCTOR_RELOAD` | 设为 `1` 时 `run.bat` 为后端加上 `--reload`（默认关闭，减少 Windows 套接字错误） |
-| `LLM_MODEL` | 大模型名（RAG 诊断必填） |
+| `SQLDOCTOR_HF_OFFICIAL` | 设为 `1` 时**不**使用默认镜像，未设 `HF_ENDPOINT` 则仍走官方 `huggingface.co`（可直连外网时用） |
+| `LLM_MODEL` | 大模型名（RAG 诊断必填）；Ollama 填 `ollama list` 里的 id，如 `deepseek-r1:1.5b` |
 | `OLLAMA_BASE_URL` | 默认 `http://127.0.0.1:11434`，会自动拼 `/v1` 给 Chat 用 |
 | `LLM_OPENAI_BASE_URL` | 覆盖完整 OpenAI 兼容根 URL（含 `/v1`） |
 | `LLM_API_KEY` | API Key；Ollama 可占位 |
+| `HF_ENDPOINT` | Hugging Face 端点根 URL；未设置且未指定 `SQLDOCTOR_HF_OFFICIAL=1` 时，程序与 `run.bat` **默认**使用 `https://hf-mirror.com`；可直连官方站时设 `SQLDOCTOR_HF_OFFICIAL=1` 或显式写 `HF_ENDPOINT=https://huggingface.co` |
 | `KB_ENABLED` | `true`/`false`，是否加载 FAISS 知识库 |
 | `KB_FAISS_PATH` | 索引目录，默认 `data/kb_faiss` |
 | `KB_SEED_PATH` | 种子 Markdown 目录，默认 `kb/seed` |
@@ -124,12 +128,15 @@ cd frontend
 pnpm dev
 ```
 
-默认通过 `next.config` 将 `/api/*` 代理到 `http://127.0.0.1:8010`（与 `API_PORT` 一致；改端口时请设置环境变量 `API_PORT` 后重新执行 `pnpm dev`）。
+开发模式下前端页面**默认直连** `http://127.0.0.1:8010/api/...`（与 `API_PORT` 一致），避免仅依赖 rewrite 时后端未起而返回 HTML 500 整页。`next.config` 仍保留 `/api/*` rewrite 供生产同源反代。改端口：`API_PORT` + 重启 `pnpm dev`，或设 `NEXT_PUBLIC_BACKEND_URL=http://127.0.0.1:你的端口`。
 
 ### Windows：`WinError 10013`（套接字访问被拒绝）
 
 1. **`run.bat` 默认已关闭 `--reload`**：Uvicorn 在 Windows 上带热重载时，重载进程会额外占用套接字，不少环境会报 10013。需要热重载时在运行前执行 `set SQLDOCTOR_RELOAD=1`（PowerShell：`$env:SQLDOCTOR_RELOAD="1"`），并已安装依赖里的 **`watchfiles`**（对重载更友好）。  
-2. **端口**：若关闭重载后仍报错，再换端口：`set API_PORT=9020` 或见下。默认 **8010**；也可用 `netstat -ano | findstr :8010` 查占用；`netsh interface ipv4 show excludedportrange protocol=tcp` 查看系统排除的端口段。
+2. **端口**：若关闭重载后仍报错，再换端口：`set API_PORT=9020` 或见下。默认 **8010**；也可用 `netstat -ano | findstr :8010` 查占用；`netsh interface ipv4 show excludedportrange protocol=tcp` 查看系统排除的端口段。  
+3. **`run.bat` 与 RAG 依赖**：若当前 Python 未安装知识库向量包，脚本会在启动前自动执行 `pip install langchain-huggingface sentence-transformers faiss-cpu`（与 `requirements.txt` 版本下限一致）。若不想安装，运行前可设 `SQLDOCTOR_SKIP_KB_PIP=1`，或在 `.env` 中设 `KB_ENABLED=false`。  
+4. **Hugging Face 仍连 `huggingface.co` / `WinError 10060`**：项目已用 **`python-dotenv` + `backend/env_bootstrap.py`** 在启动时把 `.env` 写入 `HF_ENDPOINT`，并在未配置时**默认镜像 `https://hf-mirror.com`**（`run.bat` 同步默认）。若日志里仍出现 `https://huggingface.co/...`，请执行 **`py -3 -m pip install python-dotenv`** 后重启；必须走官方站时设 **`SQLDOCTOR_HF_OFFICIAL=1`**。知识库为**后台加载**，后端会先监听 **8010**。  
+5. **仅运行 `pnpm dev`、未起 FastAPI**：Next 会把 `/api/*` 代理到 `127.0.0.1:8010`，后端未启动会出现 **`ECONNREFUSED`**。请先起后端，或使用 **`run.bat`**（会等待 `/api/health` 后再开前端）。若改了 `API_PORT`，请在启动前端的同一终端执行 `set API_PORT=你的端口`（Windows），或在 `frontend/.env.local` 写 `API_PORT=...`，与后端一致。
 
 ## API 摘要
 

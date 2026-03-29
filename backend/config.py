@@ -6,9 +6,10 @@ backend.config：应用级配置（环境变量 + Pydantic Settings）。
 
 from __future__ import annotations
 
+import os
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -56,6 +57,12 @@ class Settings(BaseSettings):
     sql_max_length: int = Field(default=256_000)
     explain_timeout_seconds: float = Field(default=30.0)
 
+    hf_endpoint: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("HF_ENDPOINT", "hf_endpoint"),
+        description="Hugging Face Hub 镜像根 URL（写入进程环境变量）；无法直连 huggingface.co 时可设 https://hf-mirror.com",
+    )
+
     kb_enabled: bool = Field(default=True, description="是否启用 FAISS 知识库与 RAG 检索")
     kb_faiss_path: str = Field(default="data/kb_faiss", description="FAISS 索引目录")
     kb_seed_path: str = Field(default="kb/seed", description="种子 Markdown 相对项目根或绝对路径")
@@ -80,4 +87,8 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
-    return Settings()
+    s = Settings()
+    # huggingface_hub / transformers 只读 os.environ，须在首次取配置时写入（早于知识库后台任务）
+    if s.hf_endpoint:
+        os.environ["HF_ENDPOINT"] = s.hf_endpoint.rstrip("/")
+    return s

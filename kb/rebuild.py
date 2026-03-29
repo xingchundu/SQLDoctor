@@ -6,6 +6,8 @@ kb.rebuild：命令行重建 FAISS 索引（需在项目根目录、已安装依
 
 from __future__ import annotations
 
+import backend.env_bootstrap  # noqa: F401 — 重建索引前应用 HF_ENDPOINT
+
 from typing import Any
 
 from kb.bootstrap import build_embeddings_from_settings

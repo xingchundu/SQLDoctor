@@ -40,6 +40,10 @@ def build_kb_embeddings(
             api_key=openai_api_key or "empty",
         )
 
+    from backend.config import get_settings
+
+    get_settings()  # 把 .env 里的 HF_ENDPOINT 写入 os.environ，避免仍去直连 huggingface.co
+
     try:
         from langchain_huggingface import HuggingFaceEmbeddings
     except ImportError as exc:

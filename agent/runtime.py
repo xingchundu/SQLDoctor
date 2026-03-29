@@ -2,44 +2,40 @@
 agent.runtime：工具运行时依赖与请求级流水线缓冲区（ContextVar）。
 
 职责：在 @tool 与 FastAPI 请求之间传递只读服务实例与中间结果，避免全局可变单例。
+
+使用 dataclass 而非 Pydantic BaseModel，避免仅放在 TYPE_CHECKING 下的类型在运行期未解析导致
+「class not fully defined」错误（Pydantic v2 + Python 3.14 等环境）。
 """
 
 from __future__ import annotations
 
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-from pydantic import BaseModel, ConfigDict, Field
 
 from analyzer.models import ParseResult, UnifiedPlan
-
-if TYPE_CHECKING:
-    from analyzer.parser import SqlParseAnalyzer
-    from analyzer.plan_fetcher import ExecutionPlanAnalyzer
-    from optimizer.rewriter import SqlRewriteService
-    from optimizer.suggestions import OptimizationSuggestionService
+from analyzer.parser import SqlParseAnalyzer
+from analyzer.plan_fetcher import ExecutionPlanAnalyzer
+from optimizer.rewriter import SqlRewriteService
+from optimizer.suggestions import OptimizationSuggestionService
 
 
-class PipelineBuffer(BaseModel):
+@dataclass
+class PipelineBuffer:
     """单次流水线在工具之间的内存结果聚合（非线程全局）。"""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
 
     parse: ParseResult | None = None
     plan: UnifiedPlan | None = None
 
 
-class ToolRuntimeDeps(BaseModel):
+@dataclass
+class ToolRuntimeDeps:
     """注入到工具闭包外的运行时依赖容器。"""
 
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
     parse_analyzer: SqlParseAnalyzer
-    plan_analyzer: ExecutionPlanAnalyzer | None = Field(default=None)
     suggestion_service: OptimizationSuggestionService
     rewriter: SqlRewriteService
-    explain_timeout_seconds: float = Field(default=30.0)
+    plan_analyzer: ExecutionPlanAnalyzer | None = None
+    explain_timeout_seconds: float = 30.0
 
 
 RUNTIME_CTX: ContextVar[ToolRuntimeDeps | None] = ContextVar(

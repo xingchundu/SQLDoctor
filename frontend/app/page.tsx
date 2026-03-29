@@ -6,6 +6,27 @@ import { Button } from "@/components/ui/button";
 
 type AnalysisResponse = Record<string, unknown>;
 
+function analysisRunUrl(): string {
+  const base = (process.env.NEXT_PUBLIC_BACKEND_URL || "").trim().replace(/\/+$/, "");
+  if (base) return `${base}/api/analysis/run`;
+  return "/api/analysis/run";
+}
+
+function formatHttpError(status: number, body: string): string {
+  const t = body.trim();
+  if (
+    t.toLowerCase().startsWith("<!doctype") ||
+    t.includes("<html") ||
+    t.includes("next-head-count")
+  ) {
+    return [
+      `HTTP ${status}：收到 Next.js 错误页（HTML），通常是本机 FastAPI 未启动或 rewrite 代理失败。`,
+      `请确认后端已监听（默认 http://127.0.0.1:8010），开发模式下页面已默认直连该地址；若仍失败请查浏览器 Network 与后端终端日志。`,
+    ].join(" ");
+  }
+  return t || `HTTP ${status}`;
+}
+
 export default function HomePage() {
   const [sql, setSql] = useState("SELECT 1 AS one");
   const [dialect, setDialect] = useState("mysql");
@@ -18,14 +39,14 @@ export default function HomePage() {
     setError(null);
     setResult(null);
     try {
-      const res = await fetch("/api/analysis/run", {
+      const res = await fetch(analysisRunUrl(), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ sql, dialect }),
       });
       if (!res.ok) {
         const text = await res.text();
-        throw new Error(text || `HTTP ${res.status}`);
+        throw new Error(formatHttpError(res.status, text));
       }
       const data = (await res.json()) as AnalysisResponse;
       setResult(data);
@@ -41,7 +62,10 @@ export default function HomePage() {
       <header>
         <h1 className="text-2xl font-semibold tracking-tight">SQL Doctor</h1>
         <p className="text-sm text-slate-600">
-          Next.js 通过 rewrite 代理到 FastAPI（默认 127.0.0.1:8010，环境变量 API_PORT）。
+          开发环境默认直连 FastAPI（<code className="rounded bg-slate-100 px-1">NEXT_PUBLIC_BACKEND_URL</code> /
+          <code className="rounded bg-slate-100 px-1">API_PORT</code>）；生产可设{" "}
+          <code className="rounded bg-slate-100 px-1">NEXT_PUBLIC_BACKEND_URL</code> 或沿用同源{" "}
+          <code className="rounded bg-slate-100 px-1">/api</code> 反代。
         </p>
       </header>
       <section className="grid gap-4 md:grid-cols-[1fr_160px]">
