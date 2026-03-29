@@ -9,7 +9,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 
 from backend.config import Settings, get_settings
-from backend.dependencies import optional_db_session
+from backend.dependencies import optional_analysis_session
 from backend.services.analysis_service import (
     AnalysisApplicationService,
     AnalysisRequest,
@@ -27,6 +27,6 @@ async def run_analysis(
 ) -> AnalysisResponse:
     factory = ToolRuntimeFactory(settings)
     svc = AnalysisApplicationService()
-    async with optional_db_session(settings) as session:
+    async with optional_analysis_session(settings, body.database_url) as session:
         runtime = await factory.build(session)
         return await svc.analyze(body, runtime=runtime)

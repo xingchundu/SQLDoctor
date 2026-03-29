@@ -26,6 +26,20 @@ class OptimizationSuggestionService:
         try:
             items = self._from_parse(parse)
             items.extend(self._from_plan(dialect, plan))
+            if plan is None:
+                items.append(
+                    OptimizationSuggestion(
+                        id=str(uuid.uuid4()),
+                        title="未采集执行计划（EXPLAIN）",
+                        detail=(
+                            "未提供可用数据库连接或未返回 EXPLAIN，无法根据 type/rows/key/Extra 做计划层建议。"
+                            "可在界面填写异步连接串并通过「测试连接」后，在分析请求中携带 database_url；"
+                            "或在服务器 .env 中配置 DATABASE_URL。"
+                        ),
+                        severity="low",
+                        rationale="计划数据缺失",
+                    )
+                )
             return SuggestionReport(dialect=dialect, items=items)
         except OptimizerError:
             raise
@@ -67,12 +81,56 @@ class OptimizationSuggestionService:
         _ = dialect
         if plan is None:
             return []
-        return [
-            OptimizationSuggestion(
-                id=str(uuid.uuid4()),
-                title="执行计划已采集",
-                detail="已获取 EXPLAIN 输出，请结合可视化与原始行进一步诊断",
-                severity="low",
-                rationale="计划结构化占位实现",
+        from analyzer.plan_analyzer import ExecutionPlanAnalyzer as PlanRiskEngine
+
+        items: list[OptimizationSuggestion] = []
+        try:
+            risk = PlanRiskEngine().analyze(plan.raw_rows or [])
+            sev_for = {
+                "FULL_TABLE_SCAN": "high",
+                "ROWS_TOO_LARGE": "high",
+                "USING_TEMPORARY": "high",
+                "USING_FILESORT": "medium",
+                "INDEX_NOT_USED": "medium",
+            }
+            for pb in risk.problems:
+                items.append(
+                    OptimizationSuggestion(
+                        id=str(uuid.uuid4()),
+                        title=f"[执行计划] {pb.title}",
+                        detail=pb.reason,
+                        severity=sev_for.get(pb.code, "medium"),
+                        rationale=pb.code,
+                    )
+                )
+            for line in risk.details[:5]:
+                items.append(
+                    OptimizationSuggestion(
+                        id=str(uuid.uuid4()),
+                        title="[执行计划] 规则摘要",
+                        detail=line,
+                        severity="low",
+                        rationale="plan_rule_summary",
+                    )
+                )
+        except Exception:
+            items.append(
+                OptimizationSuggestion(
+                    id=str(uuid.uuid4()),
+                    title="执行计划已采集",
+                    detail="已获取 EXPLAIN，但计划规则引擎解析失败，请结合响应中的 plan.raw_rows 人工查看。",
+                    severity="low",
+                    rationale="plan_parse_fallback",
+                )
             )
-        ]
+        if not items:
+            items.append(
+                OptimizationSuggestion(
+                    id=str(uuid.uuid4()),
+                    title="执行计划已采集",
+                    detail="已获取 EXPLAIN，当前规则未识别明显风险模式；请结合原始计划行与业务负载复核。",
+                    severity="low",
+                    rationale="plan_no_hits",
+                )
+            )
+        return items

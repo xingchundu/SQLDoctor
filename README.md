@@ -143,10 +143,11 @@ pnpm dev
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/health` | 健康检查 |
-| POST | `/api/analysis/run` | LangGraph 工具链：解析、EXPLAIN（可跳过）、规则建议、改写 |
+| POST | `/api/analysis/test-connection` | 校验异步连接串（与 `analysis` 同前缀，避免部分环境下 `/api/db/...` 代理异常）。兼容别名：`POST /api/db/test-connection` |
+| POST | `/api/analysis/run` | LangGraph 工具链：解析、EXPLAIN（可跳过）、规则建议、改写；可传 `database_url` 仅用于本次请求 |
 | POST | `/api/rag/diagnose` | EXPLAIN + 计划分析 + FAISS 检索 + LLM；需配置 `LLM_MODEL` |
 
-请求体字段见 `/docs` 中 Schema（如 `sql`、`dialect`、可选 `database_url`）。
+请求体字段见 `/docs` 中 Schema（如 `sql`、`dialect`、可选 `database_url`）。Next 前端已分步：选库类型 → 填连接串模板 → 测试连接 → 输入 SQL → 分析。
 
 ## 知识库内容
 

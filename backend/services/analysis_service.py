@@ -22,6 +22,10 @@ class AnalysisRequest(BaseModel):
 
     sql: str = Field(min_length=1)
     dialect: str = Field(default="mysql")
+    database_url: str | None = Field(
+        default=None,
+        description="可选；与方言匹配的 SQLAlchemy 异步连接串，用于本次请求的 EXPLAIN",
+    )
 
 
 class AnalysisResponse(BaseModel):
