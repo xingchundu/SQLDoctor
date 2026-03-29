@@ -7,6 +7,7 @@ db.repository：只读 SQL 执行与元数据查询仓储。
 from __future__ import annotations
 
 import asyncio
+import uuid
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -48,6 +49,62 @@ class ReadOnlySqlRepository:
                 details={"sql_prefix": sql[:200], "reason": str(exc)},
             ) from exc
 
+    async def run_oracle_explain_plan(
+        self,
+        sql_body: str,
+        *,
+        timeout_seconds: float,
+    ) -> list[dict[str, object]]:
+        """
+        EXPLAIN PLAN 写入 plan_table 后查询行并清理；与 analyze 无关（Oracle 运行时统计另需 DBMS_XPLAN）。
+        """
+        stmt_id = ("SD" + uuid.uuid4().hex.replace("-", ""))[:30]
+
+        async def _run() -> list[dict[str, object]]:
+            await self._session.execute(
+                text(f"EXPLAIN PLAN SET STATEMENT_ID = '{stmt_id}' FOR {sql_body}")
+            )
+            result = await self._session.execute(
+                text(
+                    """
+                    SELECT id, operation, options, object_name, object_type,
+                           cardinality, other
+                    FROM plan_table
+                    WHERE statement_id = :sid
+                    ORDER BY id
+                    """
+                ),
+                {"sid": stmt_id},
+            )
+            rows = [dict(m) for m in result.mappings().all()]
+            await self._session.execute(
+                text("DELETE FROM plan_table WHERE statement_id = :sid"),
+                {"sid": stmt_id},
+            )
+            await self._session.commit()
+            return rows
+
+        try:
+            return await asyncio.wait_for(_run(), timeout=timeout_seconds)
+        except asyncio.TimeoutError as exc:
+            try:
+                await self._session.rollback()
+            except Exception:
+                pass
+            raise DatabaseError(
+                "Oracle EXPLAIN PLAN 超时",
+                details={"timeout_seconds": timeout_seconds},
+            ) from exc
+        except Exception as exc:
+            try:
+                await self._session.rollback()
+            except Exception:
+                pass
+            raise DatabaseError(
+                "Oracle EXPLAIN PLAN 失败",
+                details={"reason": str(exc), "statement_id": stmt_id},
+            ) from exc
+
 
 class ExplainRepository:
     """按方言构造 EXPLAIN 语句并执行。"""
@@ -65,12 +122,10 @@ class ExplainRepository:
                 return f"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {body}"
             return f"EXPLAIN (FORMAT JSON) {body}"
         if dialect == SqlDialect.ORACLE:
-            if analyze:
-                raise DatabaseError(
-                    "Oracle 方言下 analyze=True 需 DBMS_XPLAN 等扩展，此处未实现",
-                    details={},
-                )
-            return f"EXPLAIN PLAN FOR {body}"
+            raise DatabaseError(
+                "Oracle EXPLAIN 请使用 run_explain 专用路径（plan_table）",
+                details={},
+            )
         raise DatabaseError("未知方言", details={"dialect": dialect.value})
 
     async def run_explain(
@@ -81,6 +136,13 @@ class ExplainRepository:
         analyze: bool,
         timeout_seconds: float,
     ) -> list[dict[str, object]]:
+        if dialect == SqlDialect.ORACLE:
+            _ = analyze
+            body = sql.strip().rstrip(";")
+            return await self._repo.run_oracle_explain_plan(
+                body,
+                timeout_seconds=timeout_seconds,
+            )
         explain_sql = self.build_explain_sql(dialect, sql, analyze)
         return await self._repo.fetch_all(
             explain_sql,

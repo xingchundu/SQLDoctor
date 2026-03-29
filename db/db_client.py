@@ -322,11 +322,7 @@ class ExplainDbClient:
         *,
         analyze: bool,
     ) -> dict[str, Any]:
-        if analyze:
-            raise DatabaseError(
-                "Oracle 当前实现不支持 analyze=True（需 DBMS_XPLAN / SQL 监控等扩展）",
-                details={},
-            )
+        _ = analyze
         body = _strip_sql_body(sql)
         stmt_id = ("SD" + uuid.uuid4().hex.replace("-", ""))[:30]
         explain_sql = f"EXPLAIN PLAN SET STATEMENT_ID = '{stmt_id}' FOR {body}"

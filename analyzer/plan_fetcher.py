@@ -64,9 +64,10 @@ class ExecutionPlanAnalyzer:
             ) from exc
         payload = _rows_to_jsonish(rows)
         tree = _build_stub_tree(dialect, payload)
+        analyzed_flag = analyze if dialect != SqlDialect.ORACLE else False
         return UnifiedPlan(
             dialect=dialect,
-            analyzed=analyze,
+            analyzed=analyzed_flag,
             raw_rows=rows,
             tree=tree,
         )
