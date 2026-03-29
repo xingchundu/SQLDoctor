@@ -26,6 +26,17 @@ class AnalysisRequest(BaseModel):
         default=None,
         description="可选；与方言匹配的 SQLAlchemy 异步连接串，用于本次请求的 EXPLAIN",
     )
+    suggestions_only: bool = Field(
+        default=False,
+        description="为 True 时响应仅含 dialect + items，不含 parse/plan/messages/rewrite",
+    )
+
+
+class SuggestionsOnlyResponse(BaseModel):
+    """仅返回规则化优化建议（精简接口）。"""
+
+    dialect: str | None = Field(default=None, description="分析所用方言")
+    items: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class AnalysisResponse(BaseModel):
@@ -102,13 +113,47 @@ class AnalysisApplicationService:
             rewrite=rewrite_data,
         )
 
-    def _safe_json(self, content: str | list[str | dict]) -> dict[str, Any]:
+    def _tool_content_to_text(self, content: Any) -> str:
+        """将 ToolMessage.content 规范为可 json.loads 的字符串（兼容 LangChain 文本块列表）。"""
+        if isinstance(content, str):
+            return content
         if isinstance(content, list):
-            return {"raw": content}
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, str):
+                    parts.append(block)
+                elif isinstance(block, dict):
+                    t = block.get("text")
+                    if isinstance(t, str):
+                        parts.append(t)
+            return "".join(parts)
+        return str(content)
+
+    def _safe_json(self, content: Any) -> dict[str, Any]:
+        raw_for_fallback: Any = content
+        text = self._tool_content_to_text(content).strip()
+        if not text:
+            if isinstance(content, list):
+                return {"raw": content}
+            return {"raw_text": str(content)}
         try:
-            data = json.loads(str(content))
+            data = json.loads(text)
             if isinstance(data, dict):
                 return data
             return {"value": data}
         except json.JSONDecodeError:
-            return {"raw_text": str(content)}
+            return {"raw_text": text, "raw": raw_for_fallback}
+
+
+def to_suggestions_only(full: AnalysisResponse) -> SuggestionsOnlyResponse:
+    """从完整分析结果中抽出建议列表。"""
+    s = full.suggestions or {}
+    dialect_val = s.get("dialect")
+    dialect_str = dialect_val if isinstance(dialect_val, str) else None
+    raw_items = s.get("items")
+    items: list[dict[str, Any]] = []
+    if isinstance(raw_items, list):
+        for it in raw_items:
+            if isinstance(it, dict):
+                items.append(it)
+    return SuggestionsOnlyResponse(dialect=dialect_str, items=items)

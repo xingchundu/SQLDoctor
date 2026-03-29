@@ -4,7 +4,80 @@ import { useMemo, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 
-type AnalysisResponse = Record<string, unknown>;
+type SuggestionItem = {
+  id?: string;
+  title?: string;
+  detail?: string;
+  severity?: string;
+  rationale?: string;
+};
+
+/** POST /api/analysis/run 且 suggestions_only=true 时的响应体 */
+type SuggestionsOnlyResponse = {
+  dialect?: string | null;
+  items?: SuggestionItem[];
+};
+
+function SuggestionsPanel({ data }: { data: unknown }) {
+  if (data == null) {
+    return (
+      <p className="text-sm text-amber-800">
+        未返回建议数据。请确认后端已更新并支持 suggestions_only。
+      </p>
+    );
+  }
+  if (typeof data !== "object") {
+    return (
+      <p className="text-sm text-amber-800">建议数据格式异常，无法展示。</p>
+    );
+  }
+  const obj = data as Record<string, unknown>;
+  const items = (Array.isArray(obj.items) ? obj.items : []) as SuggestionItem[];
+  const rawText =
+    typeof obj.raw_text === "string" ? obj.raw_text : null;
+
+  if (items.length === 0) {
+    return (
+      <div className="space-y-2 text-sm text-slate-700">
+        <p className="text-amber-800">
+          未解析到结构化建议条目（items 为空）。
+        </p>
+        {rawText ? (
+          <pre className="max-h-40 overflow-auto rounded bg-slate-100 p-2 text-xs">
+            {rawText}
+          </pre>
+        ) : null}
+      </div>
+    );
+  }
+
+  return (
+    <ul className="space-y-3">
+      {items.map((it, i) => (
+        <li
+          key={it.id ?? `sugg-${i}`}
+          className="rounded-md border border-slate-200 bg-white p-3 shadow-sm"
+        >
+          <div className="flex flex-wrap items-baseline gap-2">
+            <span className="font-medium text-slate-900">
+              {it.title ?? "（无标题）"}
+            </span>
+            {it.severity ? (
+              <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-600">
+                {it.severity}
+              </span>
+            ) : null}
+          </div>
+          {it.detail ? (
+            <p className="mt-2 text-sm leading-relaxed text-slate-700">
+              {it.detail}
+            </p>
+          ) : null}
+        </li>
+      ))}
+    </ul>
+  );
+}
 
 const CONNECTION_TEMPLATES: Record<string, string> = {
   mysql: "mysql+aiomysql://USER:PASSWORD@127.0.0.1:3306/DATABASE",
@@ -47,7 +120,7 @@ export default function HomePage() {
   const [testing, setTesting] = useState(false);
 
   const [sql, setSql] = useState("SELECT 1 AS one");
-  const [result, setResult] = useState<AnalysisResponse | null>(null);
+  const [result, setResult] = useState<SuggestionsOnlyResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
@@ -99,9 +172,15 @@ export default function HomePage() {
     setError(null);
     setResult(null);
     try {
-      const payload: { sql: string; dialect: string; database_url?: string } = {
+      const payload: {
+        sql: string;
+        dialect: string;
+        suggestions_only: boolean;
+        database_url?: string;
+      } = {
         sql,
         dialect,
+        suggestions_only: true,
       };
       if (!skipDb && databaseUrl.trim()) {
         payload.database_url = databaseUrl.trim();
@@ -115,7 +194,7 @@ export default function HomePage() {
         const text = await res.text();
         throw new Error(formatHttpError(res.status, text));
       }
-      const data = (await res.json()) as AnalysisResponse;
+      const data = (await res.json()) as SuggestionsOnlyResponse;
       setResult(data);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -129,8 +208,9 @@ export default function HomePage() {
       <header>
         <h1 className="text-2xl font-semibold tracking-tight">SQL Doctor</h1>
         <p className="text-sm text-slate-600">
-          先按数据库类型填写<strong>异步连接串</strong>并<strong>测试连接</strong>，再输入待诊断 SQL
-          获取 <strong>EXPLAIN</strong> 与优化建议。勾选「跳过数据库」则仅做静态规则分析。
+          填写<strong>异步连接串</strong>并<strong>测试连接</strong>后输入 SQL，点击分析将基于
+          EXPLAIN 与静态规则生成<strong>优化建议</strong>（仅展示建议，不展示原始解析与计划明细）。
+          勾选「跳过数据库」则仅做静态分析。
         </p>
       </header>
 
@@ -215,7 +295,7 @@ export default function HomePage() {
         </h2>
         {connOk && !skipDb ? (
           <p className="text-sm text-emerald-800">
-            连接已成功，请输入要诊断的 SQL，点击「分析」将拉取执行计划并生成建议。
+            连接已成功，请输入要诊断的 SQL，点击「生成优化建议」将拉取执行计划并输出建议。
           </p>
         ) : null}
         {skipDb ? (
@@ -233,11 +313,11 @@ export default function HomePage() {
           onClick={onAnalyze}
           disabled={loading || !canAnalyze}
         >
-          {loading ? "分析中…" : "分析"}
+          {loading ? "生成中…" : "生成优化建议"}
         </Button>
         {!skipDb && databaseUrl.trim() && !connOk && sql.trim() ? (
           <p className="text-xs text-amber-700">
-            已填写连接串：请先点击「测试连接」成功后再分析。
+            已填写连接串：请先点击「测试连接」成功后再生成建议。
           </p>
         ) : null}
       </section>
@@ -248,9 +328,15 @@ export default function HomePage() {
         </pre>
       ) : null}
       {result ? (
-        <pre className="max-h-[560px] overflow-auto rounded-md bg-slate-50 p-4 text-xs">
-          {JSON.stringify(result, null, 2)}
-        </pre>
+        <section className="rounded-lg border border-slate-200 p-4">
+          <h2 className="mb-1 text-sm font-semibold text-slate-800">
+            优化建议
+          </h2>
+          {result.dialect ? (
+            <p className="mb-3 text-xs text-slate-500">方言：{result.dialect}</p>
+          ) : null}
+          <SuggestionsPanel data={result} />
+        </section>
       ) : null}
     </main>
   );

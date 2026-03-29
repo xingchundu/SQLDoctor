@@ -14,19 +14,24 @@ from backend.services.analysis_service import (
     AnalysisApplicationService,
     AnalysisRequest,
     AnalysisResponse,
+    SuggestionsOnlyResponse,
+    to_suggestions_only,
 )
 from backend.services.runtime_factory import ToolRuntimeFactory
 
 router = APIRouter()
 
 
-@router.post("/run", response_model=AnalysisResponse)
+@router.post("/run", response_model=AnalysisResponse | SuggestionsOnlyResponse)
 async def run_analysis(
     body: AnalysisRequest,
     settings: Settings = Depends(get_settings),
-) -> AnalysisResponse:
+) -> AnalysisResponse | SuggestionsOnlyResponse:
     factory = ToolRuntimeFactory(settings)
     svc = AnalysisApplicationService()
     async with optional_analysis_session(settings, body.database_url) as session:
         runtime = await factory.build(session)
-        return await svc.analyze(body, runtime=runtime)
+        full = await svc.analyze(body, runtime=runtime)
+        if body.suggestions_only:
+            return to_suggestions_only(full)
+        return full
