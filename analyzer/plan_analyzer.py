@@ -168,6 +168,60 @@ def _plan_text_blob(step: dict[str, Any]) -> str:
     return " ".join(p for p in parts if p).lower()
 
 
+def _step_uses_index_access(step: dict[str, Any]) -> bool:
+    """
+    判断是否已走索引类访问。Oracle 将计划映射为统一 steps 时，operation/options 常并入 type，
+    「TABLE ACCESS BY INDEX ROWID BATCHED」表示按索引 ROWID 回表，不应因 key 列为空而判为未走索引。
+    """
+    blob = _plan_text_blob(step).strip().lower()
+    if not blob:
+        blob = _norm_str(step.get("type")).lower()
+    if "by index rowid" in blob or "index rowid" in blob:
+        return True
+    if re.search(
+        r"\bindex\s+(range|unique|full|skip)\s+scan\b|\bindex\s+fast\s+full\s+scan\b",
+        blob,
+    ):
+        return True
+    if "index only scan" in blob or "bitmap index" in blob:
+        return True
+    acc = _mysql_access_type(step)
+    if acc and acc != "ALL":
+        if acc in (
+            "RANGE",
+            "REF",
+            "EQ_REF",
+            "CONST",
+            "SYSTEM",
+            "INDEX",
+            "FULLTEXT",
+            "REF_OR_NULL",
+        ):
+            return True
+    return False
+
+
+def _should_apply_index_not_used_heuristic(step: dict[str, Any]) -> bool:
+    """
+    「未走索引」对标 MySQL EXPLAIN 里**表访问行**的 key 列。
+
+    Oracle plan_table 中 SELECT STATEMENT、INDEX RANGE SCAN 等行的 object_name/key 与 MySQL 含义不同；
+    若对整棵树套用 _key_is_null，会把 step1（SELECT STATEMENT）误报为 INDEX_NOT_USED。
+    规则：存在 operation 时仅对 TABLE ACCESS 行判断；否则仅 unified type 含 table access，或 MySQL 行（含 select_type）。
+    """
+    op = _norm_str(step.get("operation")).upper().strip()
+    if op:
+        return op == "TABLE ACCESS"
+    typ = _norm_str(step.get("type")).lower()
+    if re.match(r"^(select|update|delete|insert|merge)\s+statement\b", typ):
+        return False
+    if "table access" in typ:
+        return True
+    if _norm_str(step.get("select_type")):
+        return True
+    return False
+
+
 def _has_filesort(step: dict[str, Any]) -> bool:
     blob = _plan_text_blob(step)
     if "using filesort" in blob or "external merge" in blob:
@@ -295,15 +349,22 @@ class ExecutionPlanAnalyzer:
                 )
             )
 
-        if _key_is_null(step):
+        if (
+            _should_apply_index_not_used_heuristic(step)
+            and _key_is_null(step)
+            and not _step_uses_index_access(step)
+        ):
             found.append(
                 PlanProblemItem(
                     code="INDEX_NOT_USED",
-                    title="未使用索引（key 为空）",
+                    title="未走索引（计划中无索引定位 / key 为空）",
                     reason=(
-                        "key 列为空表示该步骤未选用二级索引定位数据，往往依赖主键/全表或临时结构访问。"
+                        "在 MySQL 等传统 EXPLAIN 中 key 为空常表示未选用二级索引；在 PostgreSQL、Oracle 等计划中则表现为"
+                        "Index Scan 缺失、仅 Seq Scan / TABLE ACCESS FULL 等等价形态。"
                         "若 WHERE/JOIN/ORDER BY 与现有索引不匹配，或统计信息导致优化器放弃索引，会出现此情况。"
-                        "可检查是否有覆盖谓词的复合索引，并确认 ANALYZE/统计信息及时更新。"
+                        "可检查覆盖谓词的索引，并确认 ANALYZE / DBMS_STATS 等统计信息及时更新。"
+                        "若业务上允许，建议在评估列选择性后新建或调整索引：优先覆盖等值谓词与 JOIN 键，范围条件列宜放在复合索引后部；"
+                        "具体列名与索引定义需结合表结构与负载在测试环境验证后再上线，避免盲目加索引。"
                     ),
                     affected_steps=[step_num],
                     evidence=evidence_base,
@@ -336,7 +397,7 @@ class ExecutionPlanAnalyzer:
                     code="USING_FILESORT",
                     title="需要额外排序（Using filesort / Sort）",
                     reason=(
-                        "extra 中出现 Using filesort（或计划节点为 Sort）表示无法在索引顺序下满足 ORDER BY / GROUP BY，"
+                        "MySQL 的 Using filesort、PostgreSQL/Oracle 计划中的 Sort 等节点表示无法在索引顺序下满足 ORDER BY / GROUP BY，"
                         "需要在内存或磁盘上排序；大数据量时延迟与临时空间占用明显增加。"
                         "可考虑与排序键一致的索引、减少 SELECT 列、或调整 SQL 避免无谓排序。"
                     ),
@@ -351,8 +412,8 @@ class ExecutionPlanAnalyzer:
                     code="USING_TEMPORARY",
                     title="使用临时表（Using temporary）",
                     reason=(
-                        "extra 中含 Using temporary（或类似聚合/去重节点）表示中间结果需暂存；"
-                        "连接大表、DISTINCT、GROUP BY、UNION 等容易引发磁盘临时表。"
+                        "MySQL 的 Using temporary、或其他引擎计划中的 HashAggregate/Temp Table 等类似节点表示中间结果需暂存；"
+                        "连接大表、DISTINCT、GROUP BY、UNION 等容易引发磁盘临时结构。"
                         "可评估是否能改写为更简单的子查询、添加合适索引以减少物化，或限制中间结果规模。"
                     ),
                     affected_steps=[step_num],

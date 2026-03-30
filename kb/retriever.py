@@ -28,9 +28,15 @@ class KnowledgeRetriever:
         *,
         plan_analysis: dict[str, Any] | None = None,
         k: int = 8,
+        dialect: str | None = None,
     ) -> RagContextBundle:
         plan_blob = json.dumps(plan_analysis or {}, ensure_ascii=False)[:3000]
-        query = f"SQL:\n{sql}\n\n计划/规则分析摘要:\n{plan_blob}"
+        head = (
+            f"目标数据库方言: {dialect}\n\n"
+            if dialect and str(dialect).strip()
+            else ""
+        )
+        query = f"{head}SQL:\n{sql}\n\n计划/规则分析摘要:\n{plan_blob}"
 
         def _search() -> list[tuple[Any, float]]:
             return self._vs.similarity_search_with_score(query, k=k)
