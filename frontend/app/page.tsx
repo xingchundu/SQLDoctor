@@ -267,7 +267,8 @@ export default function HomePage() {
       !databaseUrl.trim() ||
       connOk);
 
-  const useLlmPath =
+  /** 已测通连接：SQL 走完整工具链（含 EXPLAIN），仍为确定性流水线，不经 RAG/大模型 */
+  const useDbExplainPath =
     !skipDb && databaseUrl.trim().length > 0 && connOk;
 
   useEffect(() => {
@@ -342,7 +343,7 @@ export default function HomePage() {
         const data = (await res.json()) as { reply?: string };
         assistantContent =
           (typeof data.reply === "string" && data.reply) || "（无回复）";
-      } else if (useLlmPath) {
+      } else if (useDbExplainPath) {
         const res = await fetch(apiUrl("/api/analysis/run"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -411,10 +412,11 @@ export default function HomePage() {
       <header>
         <h1 className="text-2xl font-semibold tracking-tight">SQL Doctor</h1>
         <p className="text-sm text-slate-600">
-          <strong>中文或日常提问</strong>走对话（不调 EXPLAIN）；检测到 <strong>SQL</strong>{" "}
-          时再根据连接情况做诊断。已连接库时 SQL 路径会结合 EXPLAIN、本地模型与知识库；「改写
-          SQL」以 <strong>sqlglot</strong> 解析排版为准以保留 WHERE 等子句。未连接或勾选「跳过数据库」时
-          SQL 仅规则建议。
+          <strong>中文或日常提问</strong>走对话接口（不调 EXPLAIN）；识别为 <strong>SQL</strong>{" "}
+          时走解析与（可选）EXPLAIN、执行计划规则、建议与 <strong>sqlglot</strong> 格式化改写，均为确定性工具链。
+          已测通连接才会执行 EXPLAIN。需要 <strong>FAISS + 大模型</strong> 综合诊断请用{" "}
+          <code className="rounded bg-slate-100 px-1">POST /api/rag/diagnose</code> 或 README 中的
+          Streamlit 流程。
         </p>
       </header>
 
@@ -499,9 +501,9 @@ export default function HomePage() {
             2. 对话优化
           </h2>
           <p className="mt-1 text-xs text-slate-500">
-            中文对话始终可调本地模型。            SQL 语句：{" "}
-            {useLlmPath
-              ? "将走 EXPLAIN + 本地模型 + 可选知识库。"
+            中文对话走本地模型。SQL 语句：{" "}
+            {useDbExplainPath
+              ? "将走 EXPLAIN + 规则分析 + 改写（工具链，无 RAG）。"
               : skipDb
                 ? "当前为规则引擎（无 EXPLAIN）。"
                 : databaseUrl.trim() && !connOk

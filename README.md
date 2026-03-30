@@ -8,7 +8,7 @@
 - **RAG + LLM 诊断**：FAISS 检索慢 SQL 案例 / 索引规则 / 组织经验后，由大模型输出结构化 JSON（`issues` / `suggestions` / `optimized_sql`）。
 - **多库 EXPLAIN**：MySQL / PostgreSQL / Oracle（`db/db_client.py`，结构化 `steps`：`type`、`key`、`rows`、`extra`）。
 - **执行计划规则分析**：`analyzer/plan_analyzer.py`（全表扫描、未走索引、大行数、filesort、temporary 等）。
-- **SQL 改写引擎**：`optimizer/rewrite_engine.py`（列目录展开 `*`、LIMIT、逗号 JOIN 提升、索引建议注释等）。
+- **SQL 改写**：`optimizer/rewriter.py` 当前为保守 **sqlglot 格式化**（pretty），与工具链 `rewrite_sql` 一致；未启用实验性语义变换。
 
 ## 技术栈
 
@@ -143,7 +143,7 @@ pnpm dev
 | 方法 | 路径 | 说明 |
 |------|------|------|
 | GET | `/api/health` | 健康检查 |
-| POST | `/api/analysis/test-connection` | 校验异步连接串（与 `analysis` 同前缀，避免部分环境下 `/api/db/...` 代理异常）。兼容别名：`POST /api/db/test-connection` |
+| POST | `/api/analysis/test-connection` | 校验用户输入的异步连接串是否可用 |
 | POST | `/api/analysis/run` | LangGraph 工具链：解析、EXPLAIN（可跳过）、规则建议、改写；可传 `database_url` 仅用于本次请求 |
 | POST | `/api/rag/diagnose` | EXPLAIN + 计划分析 + FAISS 检索 + LLM；需配置 `LLM_MODEL` |
 
