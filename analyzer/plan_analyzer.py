@@ -18,32 +18,40 @@ RiskLevel = Literal["low", "medium", "high"]
 
 
 class PlanProblemItem(BaseModel):
-    """单条识别到的问题（含原因，便于前端与 API 序列化）。"""
+    """按规则合并后的一条问题（同一 code 多步只出现一次）。"""
 
     code: str = Field(description="稳定机器可读码")
     title: str = Field(description="短标题")
     reason: str = Field(description="为何构成问题及可能影响")
-    step_index: int | None = Field(default=None, description="对应计划步骤下标，无则 null")
+    affected_steps: list[int] = Field(
+        default_factory=list,
+        description="触发的计划步骤编号（从 1 起，与 EXPLAIN 行顺序一致）",
+    )
     evidence: dict[str, Any] = Field(
         default_factory=dict,
-        description="触发该条的字段快照，如 type/key/rows/extra",
+        description="代表性字段快照，如 type/key/rows/extra",
     )
 
 
 class PlanAnalysisReport(BaseModel):
-    """计划分析 JSON 结果（与需求字段对齐）。"""
+    """计划分析：problems 已去重；summary 与详情分离。"""
 
     problems: list[PlanProblemItem] = Field(default_factory=list)
     risk_level: RiskLevel = "low"
+    summary: dict[str, Any] = Field(
+        default_factory=dict,
+        description="统计摘要（步数、触发次数、规则分布、综合风险），不混入逐条建议正文",
+    )
     details: list[str] = Field(
         default_factory=list,
-        description="汇总性说明，便于阅读",
+        description="简短人读摘要（少量行），与 problems 中的 reason 不重复堆砌",
     )
 
     def to_json_dict(self) -> dict[str, Any]:
         return {
             "problems": [p.model_dump() for p in self.problems],
             "risk_level": self.risk_level,
+            "summary": dict(self.summary),
             "details": list(self.details),
         }
 
@@ -146,19 +154,31 @@ def _extra_text(step: dict[str, Any]) -> str:
     return _norm_str(step.get("extra"))
 
 
+def _plan_text_blob(step: dict[str, Any]) -> str:
+    """合并 MySQL/PG/Oracle 常见字段，便于跨方言匹配 filesort/temporary 等。"""
+    parts = [
+        _norm_str(step.get("type")),
+        _norm_str(step.get("extra")),
+        _norm_str(step.get("filter")),
+        _norm_str(step.get("operation")),
+        _norm_str(step.get("options")),
+        _norm_str(step.get("remarks")),
+        _norm_str(step.get("object_type")),
+    ]
+    return " ".join(p for p in parts if p).lower()
+
+
 def _has_filesort(step: dict[str, Any]) -> bool:
-    ex = _extra_text(step).lower()
-    if "using filesort" in ex:
+    blob = _plan_text_blob(step)
+    if "using filesort" in blob or "external merge" in blob:
         return True
     typ = _norm_str(step.get("type")).lower()
-    if "sort" in typ and "index" not in typ:
-        return True
-    return False
+    return "sort" in typ and "index" not in typ
 
 
 def _has_temporary(step: dict[str, Any]) -> bool:
-    ex = _extra_text(step).lower()
-    return "using temporary" in ex
+    blob = _plan_text_blob(step)
+    return "using temporary" in blob or "temporary" in blob
 
 
 class ExecutionPlanAnalyzer:
@@ -192,18 +212,66 @@ class ExecutionPlanAnalyzer:
             return PlanAnalysisReport(
                 problems=[],
                 risk_level="low",
+                summary={
+                    "total_steps": 0,
+                    "total_rule_hits": 0,
+                    "unique_rules": 0,
+                    "risk_level": "low",
+                    "rule_step_counts": {},
+                },
                 details=["未解析到任何计划步骤（steps 为空或格式不匹配），无法做规则检测。"],
             )
 
-        problems: list[PlanProblemItem] = []
+        raw: list[PlanProblemItem] = []
         for idx, step in enumerate(steps):
-            problems.extend(self._scan_step(idx, step))
+            raw.extend(self._scan_step(idx + 1, step))
 
-        risk = self._compute_risk_level(problems)
-        details = self._build_details(steps, problems, risk)
-        return PlanAnalysisReport(problems=problems, risk_level=risk, details=details)
+        merged = self._merge_problems_by_code(raw)
+        risk = self._compute_risk_level(merged)
+        summary, details = self._build_summary_and_details(steps, merged, risk)
+        return PlanAnalysisReport(
+            problems=merged,
+            risk_level=risk,
+            summary=summary,
+            details=details,
+        )
 
-    def _scan_step(self, idx: int, step: dict[str, Any]) -> list[PlanProblemItem]:
+    def _merge_problems_by_code(self, items: list[PlanProblemItem]) -> list[PlanProblemItem]:
+        by: dict[str, PlanProblemItem] = {}
+        for p in items:
+            if p.code not in by:
+                by[p.code] = p.model_copy(deep=True)
+            else:
+                cur = by[p.code]
+                merged_steps = sorted(set(cur.affected_steps + p.affected_steps))
+                by[p.code] = cur.model_copy(update={"affected_steps": merged_steps})
+        return sorted(by.values(), key=lambda x: x.code)
+
+    def _build_summary_and_details(
+        self,
+        steps: list[dict[str, Any]],
+        merged: list[PlanProblemItem],
+        risk: RiskLevel,
+    ) -> tuple[dict[str, Any], list[str]]:
+        rule_counts = {p.code: len(p.affected_steps) for p in merged}
+        total_hits = sum(rule_counts.values())
+        summary: dict[str, Any] = {
+            "total_steps": len(steps),
+            "total_rule_hits": total_hits,
+            "unique_rules": len(merged),
+            "risk_level": risk,
+            "rule_step_counts": rule_counts,
+        }
+        details = [
+            f"共 {len(steps)} 个计划步骤；识别 {len(merged)} 类规则，累计触发 {total_hits} 次。",
+            f"综合风险：{risk}。",
+        ]
+        if rule_counts:
+            dist = "、".join(f"{k}×{v}" for k, v in sorted(rule_counts.items()))
+            details.append(f"规则分布：{dist}。")
+        return summary, details
+
+    def _scan_step(self, step_num: int, step: dict[str, Any]) -> list[PlanProblemItem]:
         found: list[PlanProblemItem] = []
         evidence_base = {
             "type": step.get("type"),
@@ -222,7 +290,7 @@ class ExecutionPlanAnalyzer:
                         "I/O 与 CPU 开销随表规模线性增长；在高并发下易成为瓶颈。"
                         "若谓词选择性高，应考虑是否能通过合适索引、分区或改写 SQL 减少扫描范围。"
                     ),
-                    step_index=idx,
+                    affected_steps=[step_num],
                     evidence=evidence_base,
                 )
             )
@@ -237,7 +305,7 @@ class ExecutionPlanAnalyzer:
                         "若 WHERE/JOIN/ORDER BY 与现有索引不匹配，或统计信息导致优化器放弃索引，会出现此情况。"
                         "可检查是否有覆盖谓词的复合索引，并确认 ANALYZE/统计信息及时更新。"
                     ),
-                    step_index=idx,
+                    affected_steps=[step_num],
                     evidence=evidence_base,
                 )
             )
@@ -257,7 +325,7 @@ class ExecutionPlanAnalyzer:
                             else "若实际选择性更好，可能是统计信息过期；若估计准确，应考虑限制结果集、索引或分区。"
                         )
                     ),
-                    step_index=idx,
+                    affected_steps=[step_num],
                     evidence={**evidence_base, "rows_numeric": rows},
                 )
             )
@@ -272,7 +340,7 @@ class ExecutionPlanAnalyzer:
                         "需要在内存或磁盘上排序；大数据量时延迟与临时空间占用明显增加。"
                         "可考虑与排序键一致的索引、减少 SELECT 列、或调整 SQL 避免无谓排序。"
                     ),
-                    step_index=idx,
+                    affected_steps=[step_num],
                     evidence=evidence_base,
                 )
             )
@@ -287,46 +355,34 @@ class ExecutionPlanAnalyzer:
                         "连接大表、DISTINCT、GROUP BY、UNION 等容易引发磁盘临时表。"
                         "可评估是否能改写为更简单的子查询、添加合适索引以减少物化，或限制中间结果规模。"
                     ),
-                    step_index=idx,
+                    affected_steps=[step_num],
                     evidence=evidence_base,
                 )
             )
 
         return found
 
-    def _compute_risk_level(self, problems: list[PlanProblemItem]) -> RiskLevel:
-        if not problems:
+    def _compute_risk_level(self, merged: list[PlanProblemItem]) -> RiskLevel:
+        if not merged:
             return "low"
 
-        codes = {p.code for p in problems}
+        codes = {p.code for p in merged}
+        total_hits = sum(len(p.affected_steps) for p in merged)
+        mediumish = {"INDEX_NOT_USED", "USING_FILESORT", "USING_TEMPORARY"}
+        medium_rule_count = sum(1 for p in merged if p.code in mediumish)
+
         if "USING_FILESORT" in codes and "USING_TEMPORARY" in codes:
             return "high"
         if "FULL_TABLE_SCAN" in codes and "ROWS_TOO_LARGE" in codes:
             return "high"
-        if len(problems) >= 4:
+        if len(merged) >= 4 or total_hits >= 8:
             return "high"
-        if len(problems) >= 2:
+        if medium_rule_count >= 3:
+            return "high"
+        if len(merged) >= 2 or total_hits >= 4:
             return "medium"
-        if problems[0].code == "ROWS_TOO_LARGE":
-            rows = problems[0].evidence.get("rows_numeric")
+        if merged[0].code == "ROWS_TOO_LARGE":
+            rows = merged[0].evidence.get("rows_numeric")
             if isinstance(rows, (int, float)) and rows >= self._cfg.rows_severe:
                 return "high"
         return "medium"
-
-    def _build_details(
-        self,
-        steps: list[dict[str, Any]],
-        problems: list[PlanProblemItem],
-        risk: RiskLevel,
-    ) -> list[str]:
-        lines: list[str] = [
-            f"共分析 {len(steps)} 个计划步骤，识别到 {len(problems)} 条问题项。",
-            f"综合风险等级：{risk}（high 表示存在叠加或高危组合，建议优先排查）。",
-        ]
-        if problems:
-            by_code: dict[str, int] = {}
-            for p in problems:
-                by_code[p.code] = by_code.get(p.code, 0) + 1
-            summary = "；".join(f"{k}×{v}" for k, v in sorted(by_code.items()))
-            lines.append(f"问题类型分布：{summary}。")
-        return lines

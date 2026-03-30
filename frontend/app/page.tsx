@@ -21,6 +21,15 @@ type PlanProblemItem = {
   code?: string;
   title?: string;
   reason?: string;
+  affected_steps?: number[];
+};
+
+type PlanAnalysisSummary = {
+  total_steps?: number;
+  total_rule_hits?: number;
+  unique_rules?: number;
+  risk_level?: string;
+  rule_step_counts?: Record<string, number>;
 };
 
 /** POST /api/analysis/run 完整响应（suggestions_only: false） */
@@ -30,6 +39,7 @@ type FullAnalysisResponse = {
   plan_analysis?: {
     problems?: PlanProblemItem[];
     risk_level?: string;
+    summary?: PlanAnalysisSummary;
     details?: string[];
   } | null;
   suggestions?: {
@@ -57,6 +67,19 @@ function formatRulesReply(data: SuggestionsOnlyResponse): string {
     return `**${i + 1}. ${it.title ?? "建议"}**${sev}\n\n${it.detail ?? ""}`;
   });
   return parts.join("\n\n---\n\n");
+}
+
+/** 按 rationale + title 去重，避免摘要与详情重复罗列 */
+function dedupeSuggestionItems(items: SuggestionItem[]): SuggestionItem[] {
+  const seen = new Set<string>();
+  const out: SuggestionItem[] = [];
+  for (const it of items) {
+    const k = `${it.rationale ?? ""}::${it.title ?? ""}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(it);
+  }
+  return out;
 }
 
 function truncateText(s: string, maxLen: number): string {
@@ -99,33 +122,59 @@ function formatSqlPipelineReport(data: FullAnalysisResponse): string {
   if (
     pa &&
     ((pa.problems && pa.problems.length > 0) ||
+      (pa.summary && Object.keys(pa.summary).length > 0) ||
       (pa.details && pa.details.length > 0))
   ) {
-    const lines: string[] = ["### ③ 执行计划规则分析（type/key/rows/Extra 等）"];
-    if (pa.risk_level) {
-      lines.push("", `**综合风险**：${pa.risk_level}`);
+    const sum = pa.summary;
+    if (sum && (sum.total_steps != null || sum.unique_rules != null)) {
+      const lines: string[] = [
+        "### ③ 执行计划风险摘要（MySQL / PostgreSQL / Oracle 统一规则）",
+        "",
+        `- **综合风险**：${sum.risk_level ?? pa.risk_level ?? "—"}`,
+        `- **计划步骤数**：${sum.total_steps ?? "—"}`,
+        `- **规则种类**：${sum.unique_rules ?? "—"}（累计触发 ${sum.total_rule_hits ?? "—"} 次）`,
+      ];
+      const rc = sum.rule_step_counts;
+      if (rc && Object.keys(rc).length > 0) {
+        lines.push(
+          `- **类型分布**：${Object.entries(rc)
+            .map(([k, v]) => `${k}×${v}`)
+            .join("、")}`,
+        );
+      }
+      blocks.push(lines.join("\n"));
+    }
+    if (pa.details && pa.details.length > 0) {
+      blocks.push(
+        ["### ③‑附 简要说明", "", ...pa.details.map((d) => `- ${d}`)].join(
+          "\n",
+        ),
+      );
     }
     if (pa.problems && pa.problems.length > 0) {
-      lines.push("", "**识别项**");
+      const lines: string[] = ["### ③‑详情 执行计划问题（按规则合并，不重复）"];
       pa.problems.forEach((p, i) => {
         const code = p.code ? ` \`${p.code}\`` : "";
+        const steps =
+          Array.isArray(p.affected_steps) && p.affected_steps.length > 0
+            ? `影响步骤：${p.affected_steps.map((s) => `step${s}`).join("、")}`
+            : "";
         lines.push(
           "",
           `${i + 1}. **${p.title ?? "项"}**${code}`,
+          steps,
+          "",
           p.reason ?? "",
         );
       });
+      blocks.push(lines.join("\n"));
     }
-    if (pa.details && pa.details.length > 0) {
-      lines.push("", "**摘要**", ...pa.details.map((d) => `- ${d}`));
-    }
-    blocks.push(lines.join("\n"));
   }
 
-  const items = data.suggestions?.items ?? [];
+  const items = dedupeSuggestionItems(data.suggestions?.items ?? []);
   if (items.length > 0) {
     blocks.push(
-      "### ④ 静态 AST + 计划综合建议\n\n" +
+      "### ④ 静态 AST + 计划综合建议（已去重）\n\n" +
         formatRulesReply({
           dialect: data.suggestions?.dialect ?? null,
           items,

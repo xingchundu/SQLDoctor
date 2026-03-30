@@ -13,6 +13,7 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.errors import ParseError as SqlglotParseError
 
+from analyzer.ast_advisor import SqlAstOptimizationAdvisor, hits_to_parse_issues
 from analyzer.models import ParseIssue, ParseResult
 from app_exception import ParseError
 from db.config import SqlDialect
@@ -31,16 +32,6 @@ def _extract_tables(expression: exp.Expression) -> list[str]:
     return sorted(set(tables))
 
 
-def _select_projection_uses_star(select: exp.Select) -> bool:
-    """顶层 SELECT 是否使用裸 *（不含 COUNT(*) 这类函数内的 *）。"""
-    for e in select.expressions:
-        if isinstance(e, exp.Star):
-            return True
-        if isinstance(e, exp.Column) and isinstance(e.this, exp.Star):
-            return True
-    return False
-
-
 def _collect_issues(expression: exp.Expression) -> list[ParseIssue]:
     issues: list[ParseIssue] = []
     joins = list(expression.find_all(exp.Join))
@@ -52,19 +43,7 @@ def _collect_issues(expression: exp.Expression) -> list[ParseIssue]:
                 message=f"检测到较多 JOIN（{len(joins)}），请关注计划与统计信息",
             )
         )
-    star_seen = False
-    for select in expression.find_all(exp.Select):
-        if _select_projection_uses_star(select):
-            star_seen = True
-            break
-    if star_seen:
-        issues.append(
-            ParseIssue(
-                severity="warning",
-                code="SELECT_STAR",
-                message="检测到 SELECT *（或表.*），建议在业务中显式列出列以减少 IO、并降低表结构变更带来的风险",
-            )
-        )
+    # SELECT * 由 analyzer.ast_advisor.SqlAstOptimizationAdvisor（NO_SELECT_STAR）统一给出
     return issues
 
 
@@ -75,6 +54,11 @@ def _parse_sync(sql: str, dialect: SqlDialect) -> ParseResult:
         raise ParseError("sqlglot 解析失败", details={"reason": str(exc)}) from exc
     tables = _extract_tables(parsed)
     issues = _collect_issues(parsed)
+    issues.extend(
+        hits_to_parse_issues(
+            SqlAstOptimizationAdvisor().analyze_tree(parsed),
+        )
+    )
     normalized = parsed.sql(dialect=_sqlglot_dialect(dialect))
     return ParseResult(
         dialect=dialect,

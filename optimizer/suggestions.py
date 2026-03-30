@@ -94,23 +94,19 @@ class OptimizationSuggestionService:
                 "INDEX_NOT_USED": "medium",
             }
             for pb in risk.problems:
+                steps = list(pb.affected_steps or [])
+                step_txt = (
+                    f"影响步骤：{', '.join(f'step{s}' for s in steps)}。"
+                    if steps
+                    else ""
+                )
                 items.append(
                     OptimizationSuggestion(
                         id=str(uuid.uuid4()),
                         title=f"[执行计划] {pb.title}",
-                        detail=pb.reason,
+                        detail=f"{step_txt}{pb.reason}".strip(),
                         severity=sev_for.get(pb.code, "medium"),
                         rationale=pb.code,
-                    )
-                )
-            for line in risk.details[:5]:
-                items.append(
-                    OptimizationSuggestion(
-                        id=str(uuid.uuid4()),
-                        title="[执行计划] 规则摘要",
-                        detail=line,
-                        severity="low",
-                        rationale="plan_rule_summary",
                     )
                 )
         except Exception:

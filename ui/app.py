@@ -9,11 +9,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+from pathlib import Path
 from typing import Any
+
+_ROOT = Path(__file__).resolve().parent.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 import httpx
 import streamlit as st
 
+from analyzer.plan_analysis_text import format_plan_analysis_sections
 from app_exception import AppException
 
 DEFAULT_API = "http://127.0.0.1:8010"
@@ -89,6 +96,8 @@ def _build_summary_tools(result: dict[str, Any]) -> str:
     plan = result.get("plan") or {}
     sugg = result.get("suggestions") or {}
     rew = result.get("rewrite") or {}
+    pa = result.get("plan_analysis") or {}
+    summary = pa.get("summary") if isinstance(pa, dict) else {}
     n_issues = len(parse.get("issues") or [])
     n_items = len(sugg.get("items") or [])
     n_cand = len(rew.get("candidates") or [])
@@ -96,8 +105,12 @@ def _build_summary_tools(result: dict[str, Any]) -> str:
         plan_txt = "执行计划未拉取（无库连接或跳过）。"
     else:
         plan_txt = "已获取执行计划结构化结果。"
+    plan_rule = ""
+    if isinstance(summary, dict) and summary.get("unique_rules") is not None:
+        hits = summary.get("total_rule_hits")
+        plan_rule = f" · 计划规则 {summary.get('unique_rules')} 种（累计 {hits} 次）"
     return (
-        f"**工具链概要** · 解析问题 {n_issues} 条 · {plan_txt} "
+        f"**工具链概要** · 解析问题 {n_issues} 条 · {plan_txt}{plan_rule} "
         f"· 规则建议 {n_items} 条 · 改写候选 {n_cand} 个。"
     )
 
@@ -134,7 +147,11 @@ def _render_plan(plan: dict[str, Any] | None) -> None:
         st.code(_pretty_json(plan), language="json")
 
 
-def _render_problem_analysis(parse: dict[str, Any] | None, plan: dict[str, Any] | None) -> None:
+def _render_problem_analysis(
+    parse: dict[str, Any] | None,
+    plan: dict[str, Any] | None,
+    plan_analysis: dict[str, Any] | None = None,
+) -> None:
     parse = parse or {}
     issues = parse.get("issues") or []
     if issues:
@@ -151,10 +168,18 @@ def _render_problem_analysis(parse: dict[str, Any] | None, plan: dict[str, Any] 
     tables = parse.get("tables_referenced") or []
     st.write(", ".join(tables) if tables else "—")
 
-    st.markdown("**与执行计划相关**")
+    pa_md = format_plan_analysis_sections(
+        plan_analysis if isinstance(plan_analysis, dict) else None
+    )
+    if pa_md.strip():
+        st.markdown(pa_md)
+
+    st.markdown("**与执行计划相关（逐步启发式）**")
     if not plan or plan.get("skipped"):
         st.caption("无可用计划，无法从计划侧补充分析。")
         return
+    if pa_md.strip():
+        st.caption("上方 ③ 已基于结构化规则汇总；以下为逐步扫描的补充提示。")
     steps = plan.get("steps") or []
     hints: list[str] = []
     for i, s in enumerate(steps):
@@ -231,7 +256,11 @@ def _render_assistant_tools(result: dict[str, Any] | None, error: str | None) ->
     with tab1:
         _render_plan(result.get("plan"))
     with tab2:
-        _render_problem_analysis(result.get("parse"), result.get("plan"))
+        _render_problem_analysis(
+            result.get("parse"),
+            result.get("plan"),
+            result.get("plan_analysis"),
+        )
     with tab3:
         _render_suggestions(result.get("suggestions"))
     with tab4:
@@ -252,7 +281,13 @@ def _render_assistant_rag(result: dict[str, Any] | None, error: str | None) -> N
     with tab2:
         pa = result.get("plan_analysis") or {}
         st.markdown("**规则分析（基于 EXPLAIN）**")
-        st.code(_pretty_json(pa), language="json")
+        pa_md = format_plan_analysis_sections(pa if isinstance(pa, dict) else None)
+        if pa_md.strip():
+            st.markdown(pa_md)
+        else:
+            st.caption("无结构化 plan_analysis 摘要（可能未执行 EXPLAIN）。")
+        with st.expander("plan_analysis 完整 JSON", expanded=False):
+            st.code(_pretty_json(pa), language="json")
         st.markdown("**模型归纳的问题**")
         for i, x in enumerate(result.get("issues") or [], 1):
             st.markdown(f"{i}. {x}")
