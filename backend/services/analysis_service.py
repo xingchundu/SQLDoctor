@@ -12,6 +12,7 @@ from typing import Any
 from langchain_core.messages import AIMessage, ToolMessage
 from pydantic import BaseModel, Field
 
+from analyzer.plan_analyzer import ExecutionPlanAnalyzer
 from agent.graph import SqlDoctorAgent
 from agent.runtime import ToolRuntimeDeps
 from app_exception import AgentError
@@ -45,6 +46,10 @@ class AnalysisResponse(BaseModel):
     messages: list[dict[str, Any]] = Field(default_factory=list)
     parse: dict[str, Any] | None = None
     plan: dict[str, Any] | None = None
+    plan_analysis: dict[str, Any] | None = Field(
+        default=None,
+        description="基于 EXPLAIN raw_rows 的规则分析（problems / risk_level / details）",
+    )
     suggestions: dict[str, Any] | None = None
     rewrite: dict[str, Any] | None = None
 
@@ -105,13 +110,30 @@ class AnalysisApplicationService:
 
         if not messages_out:
             raise AgentError("流水线未产生任何消息", details={})
+        plan_analysis_data = self._plan_analysis_from_plan(plan_data)
         return AnalysisResponse(
             messages=messages_out,
             parse=parse_data,
             plan=plan_data,
+            plan_analysis=plan_analysis_data,
             suggestions=suggestions_data,
             rewrite=rewrite_data,
         )
+
+    def _plan_analysis_from_plan(
+        self, plan_data: dict[str, Any] | None
+    ) -> dict[str, Any] | None:
+        if not plan_data or not isinstance(plan_data, dict):
+            return None
+        if plan_data.get("skipped"):
+            return None
+        rows = plan_data.get("raw_rows")
+        if not isinstance(rows, list) or not rows:
+            return None
+        try:
+            return ExecutionPlanAnalyzer().analyze(rows).to_json_dict()
+        except Exception:
+            return None
 
     def _tool_content_to_text(self, content: Any) -> str:
         """将 ToolMessage.content 规范为可 json.loads 的字符串（兼容 LangChain 文本块列表）。"""

@@ -17,10 +17,28 @@ type SuggestionsOnlyResponse = {
   items?: SuggestionItem[];
 };
 
-type RagDiagnoseResponse = {
-  issues?: string[];
-  suggestions?: string[];
-  optimized_sql?: string;
+type PlanProblemItem = {
+  code?: string;
+  title?: string;
+  reason?: string;
+};
+
+/** POST /api/analysis/run 完整响应（suggestions_only: false） */
+type FullAnalysisResponse = {
+  parse?: Record<string, unknown> | null;
+  plan?: Record<string, unknown> | null;
+  plan_analysis?: {
+    problems?: PlanProblemItem[];
+    risk_level?: string;
+    details?: string[];
+  } | null;
+  suggestions?: {
+    dialect?: string;
+    items?: SuggestionItem[];
+  } | null;
+  rewrite?: {
+    candidates?: Array<{ title?: string; sql_text?: string; notes?: string }>;
+  } | null;
 };
 
 type ChatTurn = {
@@ -41,29 +59,81 @@ function formatRulesReply(data: SuggestionsOnlyResponse): string {
   return parts.join("\n\n---\n\n");
 }
 
-function formatLlmReply(data: RagDiagnoseResponse): string {
+function truncateText(s: string, maxLen: number): string {
+  if (s.length <= maxLen) return s;
+  return `${s.slice(0, maxLen)}\n…（已截断）`;
+}
+
+/** 确定性流水线：sqlglot → EXPLAIN → 计划规则 + 建议（不经过 RAG 大模型 JSON） */
+function formatSqlPipelineReport(data: FullAnalysisResponse): string {
   const blocks: string[] = [];
-  const issues = data.issues ?? [];
-  const suggestions = data.suggestions ?? [];
-  const sql = (data.optimized_sql ?? "").trim();
-  if (issues.length) {
+  blocks.push(
+    "**SQL 诊断报告**（① sqlglot → ② EXPLAIN → ③ 计划规则 → ④ 静态/综合建议）",
+  );
+
+  const cand = data.rewrite?.candidates?.[0];
+  const fromRewrite = (cand?.sql_text ?? "").trim();
+  const fromParse =
+    typeof data.parse?.normalized_sql === "string"
+      ? data.parse.normalized_sql.trim()
+      : "";
+  const sqlBlock = fromRewrite || fromParse || "（sqlglot 未产出或解析失败）";
+  blocks.push(
+    "### ① sqlglot 解析 / 格式化 SQL\n\n```sql\n" + sqlBlock + "\n```",
+  );
+
+  const plan = data.plan;
+  if (plan && typeof plan === "object" && plan.skipped === true) {
+    blocks.push("### ② EXPLAIN\n\n（未执行：无可用数据库连接）");
+  } else if (plan && typeof plan === "object" && plan.raw_rows != null) {
     blocks.push(
-      "**问题要点**\n\n" + issues.map((x, i) => `${i + 1}. ${x}`).join("\n"),
-    );
-  }
-  if (suggestions.length) {
-    blocks.push(
-      "**优化建议**\n\n" + suggestions.map((x, i) => `${i + 1}. ${x}`).join("\n"),
-    );
-  }
-  if (sql) {
-    blocks.push(
-      "**改写 SQL**（sqlglot 解析排版，保留 WHERE/JOIN 等子句）\n\n```sql\n" +
-        sql +
+      "### ② EXPLAIN（数据库 raw_rows）\n\n```json\n" +
+        truncateText(JSON.stringify(plan.raw_rows, null, 2), 14000) +
         "\n```",
     );
+  } else {
+    blocks.push("### ② EXPLAIN\n\n（无 raw_rows）");
   }
-  return blocks.length ? blocks.join("\n\n") : "模型未返回可展示内容。";
+
+  const pa = data.plan_analysis;
+  if (
+    pa &&
+    ((pa.problems && pa.problems.length > 0) ||
+      (pa.details && pa.details.length > 0))
+  ) {
+    const lines: string[] = ["### ③ 执行计划规则分析（type/key/rows/Extra 等）"];
+    if (pa.risk_level) {
+      lines.push("", `**综合风险**：${pa.risk_level}`);
+    }
+    if (pa.problems && pa.problems.length > 0) {
+      lines.push("", "**识别项**");
+      pa.problems.forEach((p, i) => {
+        const code = p.code ? ` \`${p.code}\`` : "";
+        lines.push(
+          "",
+          `${i + 1}. **${p.title ?? "项"}**${code}`,
+          p.reason ?? "",
+        );
+      });
+    }
+    if (pa.details && pa.details.length > 0) {
+      lines.push("", "**摘要**", ...pa.details.map((d) => `- ${d}`));
+    }
+    blocks.push(lines.join("\n"));
+  }
+
+  const items = data.suggestions?.items ?? [];
+  if (items.length > 0) {
+    blocks.push(
+      "### ④ 静态 AST + 计划综合建议\n\n" +
+        formatRulesReply({
+          dialect: data.suggestions?.dialect ?? null,
+          items,
+        }),
+    );
+  }
+
+  return blocks.join("\n\n---\n\n");
 }
 
 const CONNECTION_TEMPLATES: Record<string, string> = {
@@ -193,11 +263,6 @@ export default function HomePage() {
     const text = chatInput.trim();
     if (!text || !canSendChat || chatLoading) return;
 
-    const historyForApi = chatMessages.map((m) => ({
-      role: m.role,
-      content: m.content,
-    }));
-
     setChatInput("");
     setChatMessages((prev) => [
       ...prev,
@@ -229,23 +294,22 @@ export default function HomePage() {
         assistantContent =
           (typeof data.reply === "string" && data.reply) || "（无回复）";
       } else if (useLlmPath) {
-        const res = await fetch(apiUrl("/api/rag/diagnose"), {
+        const res = await fetch(apiUrl("/api/analysis/run"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             sql: text,
             dialect,
             database_url: databaseUrl.trim(),
-            analyze: false,
-            history: historyForApi,
+            suggestions_only: false,
           }),
         });
         if (!res.ok) {
           const raw = await res.text();
           throw new Error(formatHttpError(res.status, raw));
         }
-        const data = (await res.json()) as RagDiagnoseResponse;
-        assistantContent = formatLlmReply(data);
+        const data = (await res.json()) as FullAnalysisResponse;
+        assistantContent = formatSqlPipelineReport(data);
       } else {
         const payload: {
           sql: string;
@@ -386,7 +450,7 @@ export default function HomePage() {
             2. 对话优化
           </h2>
           <p className="mt-1 text-xs text-slate-500">
-            中文对话始终可调本地模型。SQL 语句：{" "}
+            中文对话始终可调本地模型。            SQL 语句：{" "}
             {useLlmPath
               ? "将走 EXPLAIN + 本地模型 + 可选知识库。"
               : skipDb
