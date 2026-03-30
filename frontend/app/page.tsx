@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 
@@ -12,71 +12,58 @@ type SuggestionItem = {
   rationale?: string;
 };
 
-/** POST /api/analysis/run 且 suggestions_only=true 时的响应体 */
 type SuggestionsOnlyResponse = {
   dialect?: string | null;
   items?: SuggestionItem[];
 };
 
-function SuggestionsPanel({ data }: { data: unknown }) {
-  if (data == null) {
-    return (
-      <p className="text-sm text-amber-800">
-        未返回建议数据。请确认后端已更新并支持 suggestions_only。
-      </p>
-    );
-  }
-  if (typeof data !== "object") {
-    return (
-      <p className="text-sm text-amber-800">建议数据格式异常，无法展示。</p>
-    );
-  }
-  const obj = data as Record<string, unknown>;
-  const items = (Array.isArray(obj.items) ? obj.items : []) as SuggestionItem[];
-  const rawText =
-    typeof obj.raw_text === "string" ? obj.raw_text : null;
+type RagDiagnoseResponse = {
+  issues?: string[];
+  suggestions?: string[];
+  optimized_sql?: string;
+};
 
+type ChatTurn = {
+  id: string;
+  role: "user" | "assistant";
+  content: string;
+};
+
+function formatRulesReply(data: SuggestionsOnlyResponse): string {
+  const items = data.items ?? [];
   if (items.length === 0) {
-    return (
-      <div className="space-y-2 text-sm text-slate-700">
-        <p className="text-amber-800">
-          未解析到结构化建议条目（items 为空）。
-        </p>
-        {rawText ? (
-          <pre className="max-h-40 overflow-auto rounded bg-slate-100 p-2 text-xs">
-            {rawText}
-          </pre>
-        ) : null}
-      </div>
+    return "未生成结构化建议条目。请确认 SQL 非空且后端正常。";
+  }
+  const parts = items.map((it, i) => {
+    const sev = it.severity ? ` · ${it.severity}` : "";
+    return `**${i + 1}. ${it.title ?? "建议"}**${sev}\n\n${it.detail ?? ""}`;
+  });
+  return parts.join("\n\n---\n\n");
+}
+
+function formatLlmReply(data: RagDiagnoseResponse): string {
+  const blocks: string[] = [];
+  const issues = data.issues ?? [];
+  const suggestions = data.suggestions ?? [];
+  const sql = (data.optimized_sql ?? "").trim();
+  if (issues.length) {
+    blocks.push(
+      "**问题要点**\n\n" + issues.map((x, i) => `${i + 1}. ${x}`).join("\n"),
     );
   }
-
-  return (
-    <ul className="space-y-3">
-      {items.map((it, i) => (
-        <li
-          key={it.id ?? `sugg-${i}`}
-          className="rounded-md border border-slate-200 bg-white p-3 shadow-sm"
-        >
-          <div className="flex flex-wrap items-baseline gap-2">
-            <span className="font-medium text-slate-900">
-              {it.title ?? "（无标题）"}
-            </span>
-            {it.severity ? (
-              <span className="rounded bg-slate-100 px-1.5 py-0.5 font-mono text-xs text-slate-600">
-                {it.severity}
-              </span>
-            ) : null}
-          </div>
-          {it.detail ? (
-            <p className="mt-2 text-sm leading-relaxed text-slate-700">
-              {it.detail}
-            </p>
-          ) : null}
-        </li>
-      ))}
-    </ul>
-  );
+  if (suggestions.length) {
+    blocks.push(
+      "**优化建议**\n\n" + suggestions.map((x, i) => `${i + 1}. ${x}`).join("\n"),
+    );
+  }
+  if (sql) {
+    blocks.push(
+      "**改写 SQL**（sqlglot 解析排版，保留 WHERE/JOIN 等子句）\n\n```sql\n" +
+        sql +
+        "\n```",
+    );
+  }
+  return blocks.length ? blocks.join("\n\n") : "模型未返回可展示内容。";
 }
 
 const CONNECTION_TEMPLATES: Record<string, string> = {
@@ -111,6 +98,30 @@ function formatHttpError(status: number, body: string): string {
   return t || `HTTP ${status}`;
 }
 
+function newId(): string {
+  if (typeof crypto !== "undefined" && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+/** 判定本轮输入是否按 SQL 走 EXPLAIN/诊断；否则走中文对话接口 */
+function isLikelySql(input: string): boolean {
+  const t = input.trim();
+  if (!t) return false;
+  const sqlKeyword =
+    /\b(select|insert|update|delete|merge|with|truncate|explain)\b/i.test(t) ||
+    /\b(create|alter|drop)\s+(table|index|view|database)\b/i.test(t) ||
+    /\b(show|desc|describe)\s+/i.test(t);
+  if (sqlKeyword) return true;
+  if (/from\s+[`"\w\[\]]+/i.test(t) && /\bwhere\b/i.test(t)) return true;
+  if (/^\s*\(?\s*select\b/i.test(t)) return true;
+  const cjk = (t.match(/[\u4e00-\u9fff\u3000-\u303f]/g) ?? []).length;
+  if (cjk > 0 && cjk / t.length >= 0.25) return false;
+  if (/[=;]/.test(t) && /\bfrom\b/i.test(t)) return true;
+  return false;
+}
+
 export default function HomePage() {
   const [dialect, setDialect] = useState("mysql");
   const [databaseUrl, setDatabaseUrl] = useState("");
@@ -119,19 +130,30 @@ export default function HomePage() {
   const [connMsg, setConnMsg] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
 
-  const [sql, setSql] = useState("SELECT 1 AS one");
-  const [result, setResult] = useState<SuggestionsOnlyResponse | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
+  const [chatMessages, setChatMessages] = useState<ChatTurn[]>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
 
   const template = useMemo(
     () => CONNECTION_TEMPLATES[dialect] ?? CONNECTION_TEMPLATES.mysql,
     [dialect],
   );
 
-  const canAnalyze =
-    sql.trim().length > 0 &&
-    (skipDb || !databaseUrl.trim() || connOk);
+  const canSendChat =
+    chatInput.trim().length > 0 &&
+    (!isLikelySql(chatInput.trim()) ||
+      skipDb ||
+      !databaseUrl.trim() ||
+      connOk);
+
+  const useLlmPath =
+    !skipDb && databaseUrl.trim().length > 0 && connOk;
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chatMessages, chatLoading]);
 
   async function onTestConnection() {
     if (!databaseUrl.trim()) {
@@ -167,39 +189,107 @@ export default function HomePage() {
     }
   }
 
-  async function onAnalyze() {
-    setLoading(true);
-    setError(null);
-    setResult(null);
+  async function onSendChat() {
+    const text = chatInput.trim();
+    if (!text || !canSendChat || chatLoading) return;
+
+    const historyForApi = chatMessages.map((m) => ({
+      role: m.role,
+      content: m.content,
+    }));
+
+    setChatInput("");
+    setChatMessages((prev) => [
+      ...prev,
+      { id: newId(), role: "user", content: text },
+    ]);
+    setChatLoading(true);
+
     try {
-      const payload: {
-        sql: string;
-        dialect: string;
-        suggestions_only: boolean;
-        database_url?: string;
-      } = {
-        sql,
-        dialect,
-        suggestions_only: true,
-      };
-      if (!skipDb && databaseUrl.trim()) {
-        payload.database_url = databaseUrl.trim();
+      let assistantContent: string;
+
+      if (!isLikelySql(text)) {
+        const messagesForNl = [
+          ...chatMessages.map((m) => ({
+            role: m.role as "user" | "assistant",
+            content: m.content,
+          })),
+          { role: "user" as const, content: text },
+        ];
+        const res = await fetch(apiUrl("/api/rag/nl-chat"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ messages: messagesForNl, dialect }),
+        });
+        if (!res.ok) {
+          const raw = await res.text();
+          throw new Error(formatHttpError(res.status, raw));
+        }
+        const data = (await res.json()) as { reply?: string };
+        assistantContent =
+          (typeof data.reply === "string" && data.reply) || "（无回复）";
+      } else if (useLlmPath) {
+        const res = await fetch(apiUrl("/api/rag/diagnose"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sql: text,
+            dialect,
+            database_url: databaseUrl.trim(),
+            analyze: false,
+            history: historyForApi,
+          }),
+        });
+        if (!res.ok) {
+          const raw = await res.text();
+          throw new Error(formatHttpError(res.status, raw));
+        }
+        const data = (await res.json()) as RagDiagnoseResponse;
+        assistantContent = formatLlmReply(data);
+      } else {
+        const payload: {
+          sql: string;
+          dialect: string;
+          suggestions_only: boolean;
+          database_url?: string;
+        } = {
+          sql: text,
+          dialect,
+          suggestions_only: true,
+        };
+        if (!skipDb && databaseUrl.trim()) {
+          payload.database_url = databaseUrl.trim();
+        }
+        const res = await fetch(apiUrl("/api/analysis/run"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) {
+          const raw = await res.text();
+          throw new Error(formatHttpError(res.status, raw));
+        }
+        const data = (await res.json()) as SuggestionsOnlyResponse;
+        assistantContent =
+          "**（规则引擎，未走本地大模型）**\n\n" + formatRulesReply(data);
       }
-      const res = await fetch(apiUrl("/api/analysis/run"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(formatHttpError(res.status, text));
-      }
-      const data = (await res.json()) as SuggestionsOnlyResponse;
-      setResult(data);
+
+      setChatMessages((prev) => [
+        ...prev,
+        { id: newId(), role: "assistant", content: assistantContent },
+      ]);
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      const msg = e instanceof Error ? e.message : String(e);
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          id: newId(),
+          role: "assistant",
+          content: `**请求失败**\n\n${msg}`,
+        },
+      ]);
     } finally {
-      setLoading(false);
+      setChatLoading(false);
     }
   }
 
@@ -208,9 +298,10 @@ export default function HomePage() {
       <header>
         <h1 className="text-2xl font-semibold tracking-tight">SQL Doctor</h1>
         <p className="text-sm text-slate-600">
-          填写<strong>异步连接串</strong>并<strong>测试连接</strong>后输入 SQL，点击分析将基于
-          EXPLAIN 与静态规则生成<strong>优化建议</strong>（仅展示建议，不展示原始解析与计划明细）。
-          勾选「跳过数据库」则仅做静态分析。
+          <strong>中文或日常提问</strong>走对话（不调 EXPLAIN）；检测到 <strong>SQL</strong>{" "}
+          时再根据连接情况做诊断。已连接库时 SQL 路径会结合 EXPLAIN、本地模型与知识库；「改写
+          SQL」以 <strong>sqlglot</strong> 解析排版为准以保留 WHERE 等子句。未连接或勾选「跳过数据库」时
+          SQL 仅规则建议。
         </p>
       </header>
 
@@ -289,55 +380,153 @@ export default function HomePage() {
         ) : null}
       </section>
 
-      <section className="flex flex-col gap-3 rounded-lg border border-slate-200 p-4">
-        <h2 className="text-sm font-semibold text-slate-800">
-          2. 待分析 SQL
-        </h2>
-        {connOk && !skipDb ? (
-          <p className="text-sm text-emerald-800">
-            连接已成功，请输入要诊断的 SQL，点击「生成优化建议」将拉取执行计划并输出建议。
-          </p>
-        ) : null}
-        {skipDb ? (
-          <p className="text-sm text-amber-800">
-            已跳过数据库：仅根据语法与静态规则给出建议，无 EXPLAIN。
-          </p>
-        ) : null}
-        <textarea
-          className="min-h-[200px] rounded-md border border-slate-200 p-3 font-mono text-sm"
-          value={sql}
-          onChange={(e) => setSql(e.target.value)}
-        />
-        <Button
-          type="button"
-          onClick={onAnalyze}
-          disabled={loading || !canAnalyze}
-        >
-          {loading ? "生成中…" : "生成优化建议"}
-        </Button>
-        {!skipDb && databaseUrl.trim() && !connOk && sql.trim() ? (
-          <p className="text-xs text-amber-700">
-            已填写连接串：请先点击「测试连接」成功后再生成建议。
-          </p>
-        ) : null}
-      </section>
-
-      {error ? (
-        <pre className="rounded-md bg-red-50 p-4 text-sm text-red-800">
-          {error}
-        </pre>
-      ) : null}
-      {result ? (
-        <section className="rounded-lg border border-slate-200 p-4">
-          <h2 className="mb-1 text-sm font-semibold text-slate-800">
-            优化建议
+      <section className="flex flex-col gap-3 rounded-lg border border-slate-200 p-0 overflow-hidden">
+        <div className="border-b border-slate-200 px-4 py-3">
+          <h2 className="text-sm font-semibold text-slate-800">
+            2. 对话优化
           </h2>
-          {result.dialect ? (
-            <p className="mb-3 text-xs text-slate-500">方言：{result.dialect}</p>
-          ) : null}
-          <SuggestionsPanel data={result} />
-        </section>
-      ) : null}
+          <p className="mt-1 text-xs text-slate-500">
+            中文对话始终可调本地模型。SQL 语句：{" "}
+            {useLlmPath
+              ? "将走 EXPLAIN + 本地模型 + 可选知识库。"
+              : skipDb
+                ? "当前为规则引擎（无 EXPLAIN）。"
+                : databaseUrl.trim() && !connOk
+                  ? "已填连接串时请先「测试连接」再发 SQL。"
+                  : "未填连接串时 SQL 仅规则建议。"}
+          </p>
+        </div>
+
+        <div className="flex max-h-[min(560px,70vh)] min-h-[320px] flex-col bg-slate-50">
+          <div className="flex-1 space-y-4 overflow-y-auto px-4 py-4">
+            {chatMessages.length === 0 ? (
+              <p className="py-10 text-center text-sm text-slate-500">
+                可发中文讨论优化思路，或直接粘贴 SQL。SQL 诊断在已连接库时带上 EXPLAIN；纯中文走对话接口。
+              </p>
+            ) : null}
+            {chatMessages.map((m) => (
+              <div
+                key={m.id}
+                className={
+                  m.role === "user"
+                    ? "flex justify-end"
+                    : "flex justify-start"
+                }
+              >
+                <div
+                  className={
+                    m.role === "user"
+                      ? "max-w-[min(100%,36rem)] rounded-2xl rounded-br-md bg-slate-800 px-4 py-2.5 text-sm text-white"
+                      : "max-w-[min(100%,36rem)] rounded-2xl rounded-bl-md border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-800 shadow-sm"
+                  }
+                >
+                  <p className="mb-1 text-[10px] font-medium uppercase tracking-wide opacity-70">
+                    {m.role === "user" ? "你" : "助手"}
+                  </p>
+                  <div className="whitespace-pre-wrap break-words leading-relaxed">
+                    {m.role === "user" ? (
+                      m.content
+                    ) : (
+                      <AssistantMarkdown text={m.content} />
+                    )}
+                  </div>
+                </div>
+              </div>
+            ))}
+            {chatLoading ? (
+              <div className="flex justify-start">
+                <div className="rounded-2xl border border-slate-200 bg-white px-4 py-3 text-sm text-slate-500 shadow-sm">
+                  正在分析…
+                </div>
+              </div>
+            ) : null}
+            <div ref={messagesEndRef} />
+          </div>
+
+          <div className="border-t border-slate-200 bg-white p-3">
+            {!skipDb && databaseUrl.trim() && !connOk ? (
+              <p className="mb-2 text-xs text-amber-700">
+                发送 <strong>SQL</strong> 前请先「测试连接」；仅中文对话可直接发送。
+              </p>
+            ) : null}
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+              <textarea
+                className="min-h-[88px] flex-1 resize-y rounded-xl border border-slate-200 px-3 py-2 font-mono text-sm outline-none focus:ring-2 focus:ring-slate-300"
+                placeholder="中文提问，或粘贴 SQL（含 select/from/where 等）…"
+                value={chatInput}
+                onChange={(e) => setChatInput(e.target.value)}
+                disabled={chatLoading}
+                onKeyDown={(e) => {
+                  if (
+                    e.key === "Enter" &&
+                    !e.shiftKey &&
+                    canSendChat &&
+                    !chatLoading
+                  ) {
+                    e.preventDefault();
+                    void onSendChat();
+                  }
+                }}
+              />
+              <Button
+                type="button"
+                className="shrink-0 sm:w-28"
+                onClick={() => void onSendChat()}
+                disabled={chatLoading || !canSendChat}
+              >
+                {chatLoading ? "发送中…" : "发送"}
+              </Button>
+            </div>
+            <p className="mt-2 text-[11px] text-slate-400">
+              Enter 发送，Shift+Enter 换行。本地模型需在服务端 .env 配置 LLM_MODEL 与
+              OLLAMA_BASE_URL（或等价 OpenAI 兼容地址）。
+            </p>
+          </div>
+        </div>
+      </section>
     </main>
+  );
+}
+
+/** 极简 Markdown 子集：**粗体** 与 ```sql 代码块，避免引入依赖 */
+function AssistantMarkdown({ text }: { text: string }) {
+  const parts = text.split(/(```[\s\S]*?```)/g);
+  return (
+    <>
+      {parts.map((part, i) => {
+        const fence = part.match(/^```(\w*)\n?([\s\S]*?)```$/);
+        if (fence) {
+          const code = fence[2] ?? "";
+          return (
+            <pre
+              key={i}
+              className="my-2 overflow-x-auto rounded-lg bg-slate-900 p-3 font-mono text-xs text-slate-100"
+            >
+              {code.trimEnd()}
+            </pre>
+          );
+        }
+        return <InlineBold key={i} text={part} />;
+      })}
+    </>
+  );
+}
+
+function InlineBold({ text }: { text: string }) {
+  const segments = text.split(/(\*\*[^*]+\*\*)/g);
+  return (
+    <>
+      {segments.map((seg, i) => {
+        const m = seg.match(/^\*\*([^*]+)\*\*$/);
+        if (m) {
+          return (
+            <strong key={i} className="font-semibold text-slate-900">
+              {m[1]}
+            </strong>
+          );
+        }
+        return <span key={i}>{seg}</span>;
+      })}
+    </>
   );
 }

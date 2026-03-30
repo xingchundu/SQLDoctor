@@ -9,8 +9,11 @@ from __future__ import annotations
 import os
 from functools import lru_cache
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# 未设置 LLM_MODEL 时使用；须与本机 `ollama list` 中已有模型名一致，否则请在 .env 中覆盖 LLM_MODEL
+DEFAULT_LLM_MODEL: str = "deepseek-r1:1.5b"
 
 
 class Settings(BaseSettings):
@@ -39,7 +42,13 @@ class Settings(BaseSettings):
     )
 
     ollama_base_url: str | None = Field(default="http://127.0.0.1:11434")
-    llm_model: str | None = Field(default=None, description="本地模型名，未设置则走无 LLM 规则编排")
+    llm_model: str = Field(
+        default=DEFAULT_LLM_MODEL,
+        description=(
+            "Ollama / OpenAI 兼容 Chat 模型名，对应环境变量 LLM_MODEL；"
+            "未设置、为空或仅空白时均回退到内置默认（见 DEFAULT_LLM_MODEL）。"
+        ),
+    )
     llm_openai_base_url: str | None = Field(
         default=None,
         description="OpenAI 兼容 Chat API 根 URL（含 /v1）；为空则由 ollama_base_url 推导",
@@ -84,6 +93,17 @@ class Settings(BaseSettings):
         description="向量 API Key，默认可复用 llm_api_key",
     )
 
+    @field_validator("llm_model", mode="before")
+    @classmethod
+    def _coerce_llm_model(cls, v: object) -> str:
+        if v is None:
+            return DEFAULT_LLM_MODEL
+        if isinstance(v, str):
+            s = v.strip()
+            return s if s else DEFAULT_LLM_MODEL
+        s = str(v).strip()
+        return s if s else DEFAULT_LLM_MODEL
+
 
 @lru_cache
 def get_settings() -> Settings:
@@ -92,3 +112,10 @@ def get_settings() -> Settings:
     if s.hf_endpoint:
         os.environ["HF_ENDPOINT"] = s.hf_endpoint.rstrip("/")
     return s
+
+
+def effective_llm_model(settings: Settings | None = None) -> str:
+    """供 Chat 客户端使用；Settings 已保证非空，此处再兜底一次。"""
+    s = settings if settings is not None else get_settings()
+    name = (s.llm_model or "").strip()
+    return name or DEFAULT_LLM_MODEL
